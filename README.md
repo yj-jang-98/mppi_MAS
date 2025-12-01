@@ -2,10 +2,28 @@
 This repository is based on [mppi_playground](https://github.com/kohonda/mppi_playground) by kohonda and [mppi_cem_tutorial](https://github.com/junyoungg/mppi_cem_tutorial) by junyoungg
 
 # Objective
-Demonstrate effectiveness of the proposed fully decentralized MPPI for multi-agent systems
+Demonstrate the effectiveness of the proposed **fully decentralized MPPI** framework for multi-agent systems
 
-# Naive implemenation 
-It can be observed that agents collide or hesitate, exhibiting inefficient behavior
+---
 
-# Our proposed method
-Every agents efficiently navigate and reach the destination in shorter time
+## Baseline: Naive Implementation
+
+<p align="center">
+  <img src="./media/navigation_2d.gif" width="500" alt="navigation2d">
+</p>
+
+Each agent treats other agents as static obstacles. As a result:
+
+- Agents frequently **hesitate** or take unnecessarily long paths.
+- Overall behavior is **inefficient**, especially in dense environments.
+
+---
+
+## Proposed Method: Fully Decentralized MPPI
+
+In the proposed method
+
+- Each agent **shares predicted trajectories** with nearby neighbors within a certain distance
+- Neighbors are treated as **moving obstacles** when computing the cost functional.
+- Agents **actively avoid collisions** while navigating efficiently
+- All agents reach the destination in **shorter time** with smoother and more coordinated motion.
