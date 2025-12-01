@@ -46,7 +46,10 @@ class RacingEnv:
         # generate reference path
         self.dl = 0.1
         self.line_width = 6.5
-        racing_center_path, _, _ = make_csv_paths("/content/mppi_cem_tutorial/src/envs/circuit_generator/circuit.csv")
+        import os
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        circuit_path = os.path.join(current_dir, "circuit_generator", "circuit.csv")
+        racing_center_path, _, _ = make_csv_paths(circuit_path)
         self.right_lane, self.left_lane = make_side_lane(racing_center_path, lane_width=self.line_width)
         # numpy array to tensor
         self.racing_center_path = torch.tensor(racing_center_path, device=self._device, dtype=self._dtype)

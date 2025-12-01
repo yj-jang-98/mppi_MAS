@@ -4,7 +4,7 @@ Kohei Honda, 2023.
 
 from __future__ import annotations
 
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 from matplotlib import pyplot as plt
 
 import torch
@@ -24,7 +24,19 @@ def angle_normalize(x):
 
 class Navigation2DEnv:
     def __init__(
-        self, v_min=0.0, v_max=2.0, omega_min=-1.0, omega_max=1.0, seed: int = 42, device=torch.device("cuda"), dtype=torch.float32
+        self,
+        v_min=0.0,
+        v_max=2.0,
+        omega_min=-1.0,
+        omega_max=1.0,
+        seed: int = 42,
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+        start_pos: Optional[Union[Tuple[float, float], torch.Tensor]] = None,
+        goal_pos: Optional[Union[Tuple[float, float], torch.Tensor]] = None,
+        obstacle_map: Optional[ObstacleMap] = None,
+        peer_safe_distance: float = 0.75,
+        peer_cost_weight: float = 10000.0,
     ) -> None:
         # device and dtype
         if torch.cuda.is_available() and device == torch.device("cuda"):
@@ -33,31 +45,48 @@ class Navigation2DEnv:
             self._device = torch.device("cpu")
         self._dtype = dtype
 
-        self._obstacle_map = ObstacleMap(
-            map_size=(20, 20), cell_size=0.1, device=self._device, dtype=self._dtype
-        )
         self._seed = seed
 
-        generate_random_obstacles(
-            obstacle_map=self._obstacle_map,
-            random_x_range=(-7.5, 7.5),
-            random_y_range=(-7.5, 7.5),
-            num_circle_obs=7,
-            radius_range=(1, 1),
-            num_rectangle_obs=7,
-            width_range=(2, 2),
-            height_range=(2, 2),
-            max_iteration=1000,
-            seed=seed,
-        )
-        self._obstacle_map.convert_to_torch()
+        if obstacle_map is None:
+            self._obstacle_map = ObstacleMap(
+                map_size=(20, 20), cell_size=0.1, device=self._device, dtype=self._dtype
+            )
 
-        self._start_pos = torch.tensor(
-            [-9.0, -9.0], device=self._device, dtype=self._dtype
+            generate_random_obstacles(
+                obstacle_map=self._obstacle_map,
+                random_x_range=(-7.5, 7.5),
+                random_y_range=(-7.5, 7.5),
+                num_circle_obs=7,
+                radius_range=(1, 1),
+                num_rectangle_obs=7,
+                width_range=(2, 2),
+                height_range=(2, 2),
+                max_iteration=1000,
+                seed=seed,
+            )
+            self._obstacle_map.convert_to_torch()
+        else:
+            # reuse a pre-generated obstacle map so multiple agents can share the same world
+            self._obstacle_map = obstacle_map
+            if getattr(self._obstacle_map, "_map_torch", None) is None:
+                self._obstacle_map.convert_to_torch()
+
+        start_pos = (
+            start_pos
+            if start_pos is not None
+            else torch.tensor([-9.0, -9.0], device=self._device, dtype=self._dtype)
         )
-        self._goal_pos = torch.tensor(
-            [9.0, 9.0], device=self._device, dtype=self._dtype
+        goal_pos = (
+            goal_pos
+            if goal_pos is not None
+            else torch.tensor([9.0, 9.0], device=self._device, dtype=self._dtype)
         )
+
+        self._start_pos = torch.as_tensor(start_pos, device=self._device, dtype=self._dtype)
+        self._goal_pos = torch.as_tensor(goal_pos, device=self._device, dtype=self._dtype)
+
+        self._peer_safe_distance = peer_safe_distance
+        self._peer_cost_weight = peer_cost_weight
 
         self._robot_state = torch.zeros(3, device=self._device, dtype=self._dtype)
         self._robot_state[:2] = self._start_pos
@@ -303,12 +332,74 @@ class Navigation2DEnv:
         pos_batch = state[:, :2].unsqueeze(1)  # (batch_size, 1, 2)
         obstacle_cost = self._obstacle_map.compute_cost(pos_batch).squeeze(1)  # (batch_size,)
 
-        cost = goal_cost + 10000 * obstacle_cost
+        # optional static-agent penalty so other robots can be treated as obstacles
+        static_agents = info.get("static_agents", None)
+        static_agent_radius = info.get("static_agent_radius", self._peer_safe_distance)
+        static_agent_weight = info.get("static_agent_weight", self._peer_cost_weight)
+        peer_cost = 0.0
+        if static_agents is not None:
+            peer_positions = static_agents
+            if not torch.is_tensor(peer_positions):
+                peer_positions = torch.tensor(peer_positions, device=self._device, dtype=self._dtype)
+            else:
+                peer_positions = peer_positions.to(self._device, self._dtype)
+
+            if peer_positions.dim() == 1:
+                peer_positions = peer_positions.unsqueeze(0)
+
+            peer_positions = peer_positions[..., :2]
+            peer_positions = peer_positions.unsqueeze(0)  # (1, num_peer, 2)
+            agent_positions = state[:, :2].unsqueeze(1)  # (batch_size, 1, 2)
+
+            peer_dist = torch.norm(agent_positions - peer_positions, dim=2)
+            proximity = torch.clamp(static_agent_radius - peer_dist, min=0.0)
+            peer_cost = torch.sum(proximity**2, dim=1)
+
+        # optional moving-agent penalty (time-varying trajectories)
+        moving_agents = info.get("moving_agents", None)
+        moving_agent_radius = info.get("moving_agent_radius", self._peer_safe_distance)
+        moving_agent_weight = info.get("moving_agent_weight", self._peer_cost_weight)
+        moving_cost = 0.0
+        if moving_agents is not None:
+            trajs = moving_agents
+            if not torch.is_tensor(trajs):
+                trajs = torch.tensor(trajs, device=self._device, dtype=self._dtype)
+            else:
+                trajs = trajs.to(self._device, self._dtype)
+
+            # expected shape: (num_peers, horizon_len, 2 or 3)
+            if trajs.dim() == 2:
+                trajs = trajs.unsqueeze(0)
+            trajs = trajs[..., :2]
+
+            # pick the waypoint at the current rollout time
+            t_idx = info.get("t", 0)
+            t_idx = int(t_idx)
+            t_idx = max(0, min(t_idx, trajs.shape[1] - 1))
+            peer_positions_t = trajs[:, t_idx, :]  # (num_peers, 2)
+            peer_positions_t = peer_positions_t.unsqueeze(0)  # (1, num_peers, 2)
+
+            agent_positions = state[:, :2].unsqueeze(1)  # (batch_size, 1, 2)
+            peer_dist = torch.norm(agent_positions - peer_positions_t, dim=2)
+            proximity = torch.clamp(moving_agent_radius - peer_dist, min=0.0)
+            moving_cost = torch.sum(proximity**2, dim=1)
+
+        cost = (
+            goal_cost
+            + 10000 * obstacle_cost
+            + static_agent_weight * peer_cost
+            + moving_agent_weight * moving_cost
+        )
 
         return cost
 
 
-    def collision_check(self, state: torch.Tensor) -> torch.Tensor:
+    def collision_check(
+        self,
+        state: torch.Tensor,
+        static_agents: Optional[torch.Tensor] = None,
+        moving_agents: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
 
         Args:
@@ -318,4 +409,46 @@ class Navigation2DEnv:
         """
         pos_batch = state[:, :, :2]
         is_collisions = self._obstacle_map.compute_cost(pos_batch).squeeze(1)
+
+        if static_agents is not None:
+            peer_positions = static_agents
+            if not torch.is_tensor(peer_positions):
+                peer_positions = torch.tensor(peer_positions, device=self._device, dtype=self._dtype)
+            else:
+                peer_positions = peer_positions.to(self._device, self._dtype)
+
+            if peer_positions.dim() == 1:
+                peer_positions = peer_positions.unsqueeze(0)
+
+            peer_positions = peer_positions[..., :2]
+            agent_positions = pos_batch.unsqueeze(2)  # (batch_size, traj, 1, 2)
+            peer_positions = peer_positions.view(1, 1, -1, 2)  # (1, 1, num_peer, 2)
+            peer_dist = torch.norm(agent_positions - peer_positions, dim=3)
+            peer_collisions = torch.any(
+                peer_dist < self._peer_safe_distance, dim=2
+            ).to(self._dtype)
+            is_collisions = torch.maximum(is_collisions, peer_collisions)
+
+        if moving_agents is not None:
+            trajs = moving_agents
+            if not torch.is_tensor(trajs):
+                trajs = torch.tensor(trajs, device=self._device, dtype=self._dtype)
+            else:
+                trajs = trajs.to(self._device, self._dtype)
+
+            if trajs.dim() == 2:
+                trajs = trajs.unsqueeze(0)
+            trajs = trajs[..., :2]  # (num_peers, horizon, 2)
+
+            horizon_len = min(trajs.shape[1], pos_batch.shape[1])
+            # align time steps
+            peer_positions = trajs[:, :horizon_len, :]  # (num_peers, T, 2)
+            peer_positions = peer_positions.permute(1, 0, 2).unsqueeze(0)  # (1, T, num_peers, 2)
+            agent_positions = pos_batch[:, :horizon_len, :].unsqueeze(2)  # (batch, T, 1, 2)
+            peer_dist = torch.norm(agent_positions - peer_positions, dim=3)
+            peer_collisions = torch.any(
+                peer_dist < self._peer_safe_distance, dim=2
+            ).to(self._dtype)
+            is_collisions = torch.maximum(is_collisions, peer_collisions)
+
         return is_collisions
