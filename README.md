@@ -9,7 +9,7 @@ Demonstrate the effectiveness of the proposed **fully decentralized MPPI** frame
 ## Baseline: Naive Implementation
 
 <p align="center">
-  <img src="./media/navigation_2d.gif" width="500" alt="navigation2d">
+  <img src="./video/staticObstacle2.gif" width="500" alt="navigation2d">
 </p>
 
 Each agent treats other agents as static obstacles. As a result:
